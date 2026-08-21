@@ -35,6 +35,13 @@ usuarios_autorizados = set()
 grupos_por_usuario = {}
 estado_panel = {}   # {user_id: {"chat_id": int, "step": str}}
 
+# Texto recordatorio del comando /principal (grupos de temas / forum)
+TIP_PRINCIPAL = (
+    "\n\n💡 Si este es un grupo de TEMAS (forum): entra al tema donde quieres "
+    "que se envíen las bienvenidas y envía ahí /principal. "
+    "Si no lo haces, las bienvenidas se enviarán en el tema General."
+)
+
 # --- SERVIDOR WEB ---
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -76,7 +83,15 @@ def cargar_grupos_usuario(user_id):
 def get_bienvenida(chat_id):
     doc = col_bienvenida.find_one({"chat_id": chat_id})
     if not doc:
-        return {"chat_id": chat_id, "texto": None, "media_file_id": None, "media_type": None, "botones_raw": None}
+        return {
+            "chat_id": chat_id,
+            "texto": None,
+            "media_file_id": None,
+            "media_type": None,
+            "botones_raw": None,
+            "topic_principal": None,
+        }
+    doc.setdefault("topic_principal", None)
     return doc
 
 def save_bienvenida_campo(chat_id, campo, valor):
@@ -222,9 +237,54 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if uid in admins_ids:
             registrar_grupo(uid, chat.id, chat.title)
     try:
-        await update.message.reply_text("✅ Grupo registrado. Ahora ve al bot en privado y usa /start.")
+        await update.message.reply_text(
+            "✅ Grupo registrado. Ahora ve al bot en privado y usa /start."
+            + (TIP_PRINCIPAL if chat.is_forum else "")
+        )
     except:
         pass
+
+async def cmd_principal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Enviado dentro de un tema de un grupo de temas (forum), guarda ese tema
+    como destino de los mensajes de bienvenida para ese grupo.
+    Enviado en el tema General (sin thread_id), vuelve a mandar las
+    bienvenidas al chat/tema General.
+    """
+    chat = update.effective_chat
+    user_id = update.effective_user.id
+
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    try:
+        admins = await context.bot.get_chat_administrators(chat.id)
+        admins_ids = {a.user.id for a in admins}
+    except:
+        return
+
+    if user_id not in admins_ids:
+        return
+
+    if not chat.is_forum:
+        await update.message.reply_text(
+            "ℹ️ Este grupo no tiene temas activados, así que no necesitas /principal.\n"
+            "Las bienvenidas ya se envían normalmente en el chat."
+        )
+        return
+
+    thread_id = update.message.message_thread_id  # None si es el tema General
+    save_bienvenida_campo(chat.id, "topic_principal", thread_id)
+
+    if thread_id:
+        await update.message.reply_text(
+            "✅ A partir de ahora las bienvenidas se enviarán en ESTE tema.",
+            message_thread_id=thread_id
+        )
+    else:
+        await update.message.reply_text(
+            "✅ A partir de ahora las bienvenidas se enviarán en el tema General."
+        )
 
 # --- DETECCIÓN DE NUEVOS MIEMBROS (join directo o solicitud aceptada) ---
 
@@ -252,6 +312,7 @@ async def enviar_bienvenida(context, chat_id, user):
     media_file_id = conf.get("media_file_id")
     media_type = conf.get("media_type")
     botones_raw = conf.get("botones_raw")
+    topic_principal = conf.get("topic_principal")  # None = grupo normal o tema General
 
     if not texto and not media_file_id:
         return  # Sin bienvenida configurada
@@ -267,22 +328,31 @@ async def enviar_bienvenida(context, chat_id, user):
         except:
             pass
 
+    # Solo se pasa message_thread_id si hay un tema configurado con /principal.
+    # En grupos normales (sin temas) esto queda como None y se envía como siempre.
+    envio_kwargs = {}
+    if topic_principal:
+        envio_kwargs["message_thread_id"] = topic_principal
+
     nuevo_msg = None
     try:
         if media_type == "photo" and media_file_id:
             nuevo_msg = await context.bot.send_photo(
                 chat_id=chat_id, photo=media_file_id,
-                caption=texto_final, parse_mode="Markdown", reply_markup=markup
+                caption=texto_final, parse_mode="Markdown", reply_markup=markup,
+                **envio_kwargs
             )
         elif media_type == "video" and media_file_id:
             nuevo_msg = await context.bot.send_video(
                 chat_id=chat_id, video=media_file_id,
-                caption=texto_final, parse_mode="Markdown", reply_markup=markup
+                caption=texto_final, parse_mode="Markdown", reply_markup=markup,
+                **envio_kwargs
             )
         else:
             nuevo_msg = await context.bot.send_message(
                 chat_id=chat_id, text=texto_final or "👋",
-                parse_mode="Markdown", reply_markup=markup
+                parse_mode="Markdown", reply_markup=markup,
+                **envio_kwargs
             )
     except Exception as e:
         logging.warning(f"Error enviando bienvenida: {e}")
@@ -450,7 +520,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "bienv_inicio":
         estado_panel[user_id]["step"] = "idle"
         await query.edit_message_text(
-            "👋 Configuración de Mensaje de Bienvenida:",
+            f"👋 Configuración de Mensaje de Bienvenida:{TIP_PRINCIPAL}",
             reply_markup=menu_bienvenida()
         )
         return
@@ -529,6 +599,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload", cmd_reload))
+    app.add_handler(CommandHandler("principal", cmd_principal))
     app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(callback_handler))
     app.add_handler(MessageHandler(filters.ALL, handle_message))
