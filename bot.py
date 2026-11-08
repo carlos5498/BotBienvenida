@@ -3,8 +3,12 @@ import asyncio
 import logging
 import threading
 import hashlib
+import re
+import time
+import uuid
+from html import escape as html_escape
 from urllib.parse import quote
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMemberUpdated
 from telegram.ext import (
     Application,
@@ -35,7 +39,9 @@ col_programado = db['mensaje_programado']
 
 usuarios_autorizados = set()
 grupos_por_usuario = {}
-estado_panel = {}   # {user_id: {"chat_id": int, "step": str}}
+estado_panel = {}   # {user_id: {"chat_id": int, "step": str, "pid": id del mensaje programado elegido}}
+
+MAX_PROGRAMADOS = 20  # mensajes programados por grupo
 
 INTERVALOS = {
     "1h": 60 * 60,
@@ -58,12 +64,14 @@ class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200); self.end_headers()
         self.wfile.write(b"Bot Mensajes Activo")
+    def do_HEAD(self):
+        self.send_response(200); self.end_headers()
     def log_message(self, format, *args):
         pass
 
 def run_web_server():
     port = int(os.environ.get("PORT", 8080))
-    HTTPServer(('0.0.0.0', port), SimpleHandler).serve_forever()
+    ThreadingHTTPServer(('0.0.0.0', port), SimpleHandler).serve_forever()
 
 # --- HELPERS ---
 
@@ -130,26 +138,42 @@ def get_bienvenida(chat_id):
 def save_bienvenida_campo(chat_id, campo, valor):
     col_bienvenida.update_one({"chat_id": chat_id}, {"$set": {campo: valor}}, upsert=True)
 
-def get_programado(chat_id):
-    doc = col_programado.find_one({"chat_id": chat_id})
+def migrar_programados():
+    """Los mensajes programados guardados con la versión anterior (uno por grupo) pasan a ser el #1."""
+    for d in col_programado.find({"pid": {"$exists": False}}):
+        col_programado.update_one({"_id": d["_id"]}, {"$set": {"pid": "p1", "num": 1}})
+
+def listar_programados(chat_id):
+    docs = list(col_programado.find({"chat_id": chat_id}))
+    docs.sort(key=lambda d: d.get("num", 0))
+    return docs
+
+def get_programado(chat_id, pid):
+    doc = col_programado.find_one({"chat_id": chat_id, "pid": pid})
     if not doc:
-        return {
-            "chat_id": chat_id,
-            "texto": None,
-            "media_file_id": None,
-            "media_type": None,
-            "botones_raw": None,
-            "activo": False,
-            "intervalo": None,
-            "ultimo_envio_ts": None,
-        }
+        return None
     doc.setdefault("activo", False)
     doc.setdefault("intervalo", None)
     doc.setdefault("ultimo_envio_ts", None)
+    doc.setdefault("num", 1)
     return doc
 
-def save_programado_campo(chat_id, campo, valor):
-    col_programado.update_one({"chat_id": chat_id}, {"$set": {campo: valor}}, upsert=True)
+def save_programado_campo(chat_id, pid, campo, valor):
+    # sin upsert: si el mensaje fue eliminado, un envío pendiente no lo vuelve a crear
+    col_programado.update_one({"chat_id": chat_id, "pid": pid}, {"$set": {campo: valor}})
+
+def crear_programado(chat_id):
+    num = max([d.get("num", 0) for d in listar_programados(chat_id)] + [0]) + 1
+    pid = uuid.uuid4().hex[:8]
+    col_programado.insert_one({
+        "chat_id": chat_id, "pid": pid, "num": num, "texto": None, "media_file_id": None,
+        "media_type": None, "botones_raw": None, "activo": False, "intervalo": None,
+        "ultimo_envio_ts": None,
+    })
+    return pid, num
+
+def eliminar_programado(chat_id, pid):
+    col_programado.delete_many({"chat_id": chat_id, "pid": pid})
 
 def guardar_short_id(texto):
     short_id = hashlib.md5(texto.encode("utf-8")).hexdigest()[:16]
@@ -160,52 +184,130 @@ def obtener_texto_por_id(short_id):
     doc = col_botones_data.find_one({"_id": short_id})
     return doc.get("texto") if doc else None
 
-def construir_boton(titulo, resto):
+COLORES_BOTON = {"g": "success", "r": "danger", "p": "primary"}   # verde, rojo, azul
+TAG_COLOR_RE = re.compile(r"^#([grp])\b\s*", re.I)
+EMOJI_PREMIUM_RE = re.compile(r"^\[\[ce:(\d+)\]\]\s*")
+EMOJI_PREMIUM_ANY_RE = re.compile(r"\[\[ce:\d+\]\]")
+
+def tokenizar_emojis(msg):
+    """Convierte los emojis premium (emoji personalizados) del texto en marcas [[ce:ID]] para poder
+    guardarlos como texto. Respeta los offsets en UTF-16 que usa Telegram."""
+    texto = msg.text or ""
+    ents = sorted((e for e in (msg.entities or ()) if e.type == "custom_emoji"), key=lambda e: e.offset)
+    if not ents:
+        return texto
+    data = texto.encode("utf-16-le")
+    out, pos = [], 0
+    for e in ents:
+        out.append(data[pos * 2:e.offset * 2].decode("utf-16-le"))
+        out.append(f"[[ce:{e.custom_emoji_id}]]")
+        pos = e.offset + e.length
+    out.append(data[pos * 2:].decode("utf-16-le"))
+    return "".join(out)
+
+def parsear_titulo(titulo):
+    """'#g [[ce:123]] Título' -> ('Título', 'success', '123'). Solo un emoji premium inicial puede ir
+    como icono del botón; los demás quedan como el emoji normal (Telegram no los admite dentro del texto)."""
+    style = icon = None
+    m = TAG_COLOR_RE.match(titulo)
+    if m:
+        style = COLORES_BOTON[m.group(1).lower()]
+        titulo = titulo[m.end():]
+    m = EMOJI_PREMIUM_RE.match(titulo)
+    if m:
+        icon = m.group(1)
+        titulo = titulo[m.end():]
+    titulo = EMOJI_PREMIUM_ANY_RE.sub("", titulo).strip()
+    return titulo, style, icon
+
+def _boton(titulo, style=None, icon=None, **kw):
+    extra = {}
+    if style:
+        extra["style"] = style
+    if icon:
+        extra["icon_custom_emoji_id"] = icon
+    # api_kwargs envía los campos nuevos de la Bot API 9.4 aunque la librería aún no los traiga
+    return InlineKeyboardButton(titulo, api_kwargs=extra or None, **kw)
+
+def construir_boton(titulo, resto, style=None, icon=None):
     resto_lower = resto.lower()
     if resto_lower.startswith("popup:") or resto_lower.startswith("alert:"):
         texto_popup = resto.split(":", 1)[1].strip()
         short_id = guardar_short_id(texto_popup)
-        return InlineKeyboardButton(titulo, callback_data=f"wpopup_{short_id}")
+        return _boton(titulo, style, icon, callback_data=f"wpopup_{short_id}")
     if resto_lower.startswith("share:"):
         texto_compartir = resto.split(":", 1)[1].strip()
         url = f"https://t.me/share/url?url=&text={quote(texto_compartir)}"
-        return InlineKeyboardButton(titulo, url=url)
+        return _boton(titulo, style, icon, url=url)
     if resto_lower.startswith("copy:"):
         texto_copiar = resto.split(":", 1)[1].strip()
         short_id = guardar_short_id(texto_copiar)
-        return InlineKeyboardButton(titulo, callback_data=f"wcopy_{short_id}")
+        return _boton(titulo, style, icon, callback_data=f"wcopy_{short_id}")
     if resto_lower.strip() == "rules":
-        return InlineKeyboardButton(titulo, callback_data="wrules_none")
+        return _boton(titulo, style, icon, callback_data="wrules_none")
     # Por defecto: botón de enlace (URL)
     url = resto.strip()
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
-    return InlineKeyboardButton(titulo, url=url)
+    return _boton(titulo, style, icon, url=url)
 
-def parsear_botones(texto_botones):
+def parsear_botones_ext(texto_botones):
+    """Devuelve (teclado, teclado_simple). El simple no lleva colores ni iconos: se usa de respaldo si
+    Telegram rechazara el icono premium (p. ej. si el dueño del bot no tiene Premium)."""
     if not texto_botones:
-        return None
-    filas = texto_botones.strip().split("\n")
-    keyboard = []
-    for fila in filas:
+        return None, None
+    completo, simple = [], []
+    hay_extras = False
+    for fila in texto_botones.strip().split("\n"):
         fila = fila.strip()
         if not fila:
             continue
-        partes = fila.split("&&")
-        row = []
-        for parte in partes:
+        row, row_s = [], []
+        for parte in fila.split("&&"):
             parte = parte.strip()
             if " - " not in parte:
                 continue
             titulo, resto = parte.split(" - ", 1)
-            titulo = titulo.strip()
+            titulo, style, icon = parsear_titulo(titulo.strip())
             resto = resto.strip()
             if not titulo or not resto:
                 continue
-            row.append(construir_boton(titulo, resto))
+            row.append(construir_boton(titulo, resto, style, icon))
+            row_s.append(construir_boton(titulo, resto))
+            hay_extras = hay_extras or bool(style or icon)
         if row:
-            keyboard.append(row)
-    return InlineKeyboardMarkup(keyboard) if keyboard else None
+            completo.append(row)
+            simple.append(row_s)
+    if not completo:
+        return None, None
+    return InlineKeyboardMarkup(completo), (InlineKeyboardMarkup(simple) if hay_extras else None)
+
+def parsear_botones(texto_botones):
+    return parsear_botones_ext(texto_botones)[0]
+
+FORMATO_TYPES = {"custom_emoji", "bold", "italic", "underline", "strikethrough", "spoiler", "code", "pre",
+                 "text_link", "blockquote", "expandable_blockquote", "text_mention"}
+
+def datos_texto(msg):
+    """Qué se guarda al editar un texto: el texto plano y, si el admin usó emojis premium o el formato
+    nativo de Telegram (negrita, enlaces...), también su versión HTML. Si no usó nada de eso, el texto
+    sigue funcionando con el Markdown clásico de siempre (*negrita*, [texto](link))."""
+    plano = msg.text or ""
+    rico = any(e.type in FORMATO_TYPES for e in (msg.entities or ()))
+    return {"texto": plano, "texto_html": msg.text_html if rico else None}
+
+def preparar_texto(conf, user=None):
+    """(texto_a_enviar, formato, texto_plano_de_respaldo)."""
+    plano = conf.get("texto") or ""
+    h = conf.get("texto_html")
+    if h:
+        if user is not None:
+            h = h.replace("{MENTION}", f'<a href="tg://user?id={user.id}">{html_escape(user.first_name or "")}</a>')
+            plano = plano.replace("{MENTION}", user.first_name or "")
+        return h, "html", plano
+    if user is not None:
+        return (construir_texto_bienvenida(plano, user) if plano else None), None, None
+    return (plano or None), None, None
 
 def construir_texto_bienvenida(texto, user):
     if not texto:
@@ -214,33 +316,53 @@ def construir_texto_bienvenida(texto, user):
     return texto.replace("{MENTION}", mention)
 
 async def enviar_mensaje_seguro(bot, chat_id, texto, media_file_id, media_type, markup, **extra):
-    """Envía texto/foto/video intentando primero con Markdown. Si el texto trae símbolos
-    (_ * [ ] ( )) sin balancear, Telegram rechaza el envío -- en ese caso reintenta
-    automáticamente en texto plano (sin formato) para que el mensaje SIEMPRE se mande."""
-    async def _send(parse_mode):
+    """Envía texto/foto/video y se asegura de que el mensaje SIEMPRE salga. Intentos, en orden:
+    1) con el formato y los botones tal cual (HTML con emojis premium, o Markdown clásico);
+    2) con botones simples (sin color ni icono premium), si Telegram rechazó los botones;
+    3) en texto plano, si el formato era inválido o Telegram rechazó los emojis premium."""
+    fallback = extra.pop("markup_fallback", None)
+    fmt = extra.pop("fmt", None)
+    plano = extra.pop("plain", None)
+    pm = "HTML" if fmt == "html" else "Markdown"
+    texto_plano = plano if plano is not None else texto
+
+    async def _send(parse_mode, mk, tx):
         if media_type == "photo" and media_file_id:
             return await bot.send_photo(
-                chat_id=chat_id, photo=media_file_id, caption=texto,
-                parse_mode=parse_mode, reply_markup=markup, **extra
+                chat_id=chat_id, photo=media_file_id, caption=tx,
+                parse_mode=parse_mode, reply_markup=mk, **extra
             )
         elif media_type == "video" and media_file_id:
             return await bot.send_video(
-                chat_id=chat_id, video=media_file_id, caption=texto,
-                parse_mode=parse_mode, reply_markup=markup, **extra
+                chat_id=chat_id, video=media_file_id, caption=tx,
+                parse_mode=parse_mode, reply_markup=mk, **extra
             )
         else:
             return await bot.send_message(
-                chat_id=chat_id, text=texto or "👋",
-                parse_mode=parse_mode, reply_markup=markup, **extra
+                chat_id=chat_id, text=tx or "👋",
+                parse_mode=parse_mode, reply_markup=mk, **extra
             )
-    try:
-        return await _send("Markdown")
-    except BadRequest as e:
-        msg = str(e).lower()
-        if "parse entities" in msg or "can't find end" in msg or "character" in msg:
-            logging.warning(f"⚠️ Markdown inválido en chat {chat_id}, reenviando en texto plano: {e}")
-            return await _send(None)
-        raise
+
+    intentos = [(pm, markup, texto)]
+    if fallback is not None:
+        intentos.append((pm, fallback, texto))
+    intentos.append((None, markup, texto_plano))
+    if fallback is not None:
+        intentos.append((None, fallback, texto_plano))
+
+    ultimo, solo_plano = None, False
+    for parse_mode, mk, tx in intentos:
+        if solo_plano and parse_mode is not None:
+            continue
+        try:
+            return await _send(parse_mode, mk, tx)
+        except BadRequest as e:
+            ultimo = e
+            m = str(e).lower()
+            if any(k in m for k in ("parse entities", "can't find end", "character", "entit")):
+                solo_plano = True
+            logging.warning(f"⚠️ Envío rechazado en {chat_id} ({e}); probando una versión más simple")
+    raise ultimo
 
 # --- TECLADOS ---
 
@@ -259,7 +381,7 @@ def menu_grupo_panel():
     keyboard = [
         [InlineKeyboardButton("📨 Enviar Mensaje", callback_data="msg_enviar")],
         [InlineKeyboardButton("👋 Mensaje de Bienvenida", callback_data="bienv_inicio")],
-        [InlineKeyboardButton("📌 Mensaje Programado", callback_data="prog_inicio")],
+        [InlineKeyboardButton("📌 Mensajes Programados", callback_data="prog_inicio")],
         [InlineKeyboardButton("🔄 Cambiar grupo", callback_data="sel_grupo")],
     ]
     return InlineKeyboardMarkup(keyboard)
@@ -282,11 +404,26 @@ def menu_editor_campo(cb_eliminar, cb_atras):
         [InlineKeyboardButton("⬅️ Cancelar y Atrás", callback_data=cb_atras)],
     ])
 
-def menu_programado(chat_id):
-    conf = get_programado(chat_id)
+def menu_lista_programados(chat_id):
+    keyboard = []
+    for d in listar_programados(chat_id):
+        estado = "🟢" if d.get("activo") else "🔴"
+        iv = d.get("intervalo") or "—"
+        prev = (d.get("texto") or ("📷 multimedia" if d.get("media_file_id") else "vacío"))
+        prev = EMOJI_PREMIUM_ANY_RE.sub("", prev).replace("\n", " ")[:18]
+        keyboard.append([InlineKeyboardButton(f"{estado} #{d.get('num', 1)} · {iv} · {prev}",
+                                              callback_data=f"prog_sel_{d['pid']}")])
+    if len(keyboard) < MAX_PROGRAMADOS:
+        keyboard.append([InlineKeyboardButton("➕ Nuevo mensaje programado", callback_data="prog_nuevo")])
+    keyboard.append([InlineKeyboardButton("⬅️ Atrás", callback_data="back_main")])
+    return InlineKeyboardMarkup(keyboard)
+
+def menu_programado(chat_id, pid):
+    conf = get_programado(chat_id, pid)
+    if not conf:
+        return menu_lista_programados(chat_id)
     activo = conf.get("activo", False)
-    intervalo_key = conf.get("intervalo")
-    intervalo_txt = INTERVALOS_LABEL.get(intervalo_key, "Sin elegir")
+    intervalo_txt = INTERVALOS_LABEL.get(conf.get("intervalo"), "Sin elegir")
     estado_txt = "🟢 ENCENDIDO" if activo else "🔴 APAGADO"
     keyboard = [
         [InlineKeyboardButton("📝 Editar Texto", callback_data="prog_texto")],
@@ -295,18 +432,19 @@ def menu_programado(chat_id):
         [InlineKeyboardButton("👀 Vista Previa", callback_data="prog_preview")],
         [InlineKeyboardButton(f"⏱️ Intervalo: {intervalo_txt}", callback_data="prog_intervalo")],
         [InlineKeyboardButton(f"Estado: {estado_txt}", callback_data="prog_toggle")],
-        [InlineKeyboardButton("⬅️ Atrás", callback_data="back_main")],
+        [InlineKeyboardButton("🗑️ Eliminar este mensaje", callback_data="prog_eliminar")],
+        [InlineKeyboardButton("⬅️ Atrás (lista)", callback_data="prog_inicio")],
     ]
     return InlineKeyboardMarkup(keyboard)
 
-def menu_intervalo(chat_id):
-    conf = get_programado(chat_id)
+def menu_intervalo(chat_id, pid):
+    conf = get_programado(chat_id, pid) or {}
     actual = conf.get("intervalo")
     keyboard = []
     for key, label in INTERVALOS_LABEL.items():
         prefix = "✅ " if key == actual else ""
         keyboard.append([InlineKeyboardButton(f"{prefix}{label}", callback_data=f"prog_setint_{key}")])
-    keyboard.append([InlineKeyboardButton("⬅️ Atrás", callback_data="prog_inicio")])
+    keyboard.append([InlineKeyboardButton("⬅️ Atrás", callback_data="prog_item")])
     return InlineKeyboardMarkup(keyboard)
 
 def boton_atras(destino):
@@ -439,8 +577,8 @@ async def enviar_bienvenida(context, chat_id, user):
     if not texto and not media_file_id:
         return  # Sin bienvenida configurada
 
-    texto_final = construir_texto_bienvenida(texto, user) if texto else None
-    markup = parsear_botones(botones_raw) if botones_raw else None
+    texto_final, fmt, plano = preparar_texto(conf, user) if texto else (None, None, None)
+    markup, markup_simple = parsear_botones_ext(botones_raw)
 
     # Borrar mensaje de bienvenida anterior
     anterior = col_ultimo_msg.find_one({"chat_id": chat_id})
@@ -460,7 +598,7 @@ async def enviar_bienvenida(context, chat_id, user):
     try:
         nuevo_msg = await enviar_mensaje_seguro(
             context.bot, chat_id, texto_final, media_file_id, media_type, markup,
-            **envio_kwargs
+            markup_fallback=markup_simple, fmt=fmt, plain=plano, **envio_kwargs
         )
     except Exception as e:
         logging.warning(f"Error enviando bienvenida: {e}")
@@ -473,14 +611,18 @@ async def enviar_bienvenida(context, chat_id, user):
             upsert=True
         )
 
-# --- MENSAJE PROGRAMADO (se repite cada intervalo, fijado, borra el anterior) ---
+# --- MENSAJES PROGRAMADOS (varios por grupo; cada uno se repite, se fija y borra su copia anterior) ---
+
+def nombre_job(chat_id, pid):
+    return f"programado_{chat_id}_{pid}"
 
 async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
     chat_id = context.job.chat_id
-    conf = get_programado(chat_id)
+    pid = context.job.data
+    conf = get_programado(chat_id, pid)
 
-    if not conf.get("activo"):
-        return  # Se desactivó; el job se remueve aparte, esto es una salvaguarda extra
+    if not conf or not conf.get("activo"):
+        return  # Se eliminó o se apagó; el job se remueve aparte, esto es una salvaguarda extra
 
     texto = conf.get("texto")
     media_file_id = conf.get("media_file_id")
@@ -490,9 +632,10 @@ async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
     if not texto and not media_file_id:
         return  # No hay contenido configurado, no hay nada que enviar
 
-    markup = parsear_botones(botones_raw) if botones_raw else None
+    markup, markup_simple = parsear_botones_ext(botones_raw)
+    texto, fmt, plano = preparar_texto(conf)
 
-    # Borrar el mensaje programado anterior (igual que la bienvenida)
+    # Borrar la copia anterior de ESTE mensaje programado
     anterior = conf.get("ultimo_message_id")
     if anterior:
         try:
@@ -503,7 +646,8 @@ async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
     nuevo_msg = None
     try:
         nuevo_msg = await enviar_mensaje_seguro(
-            context.bot, chat_id, texto, media_file_id, media_type, markup
+            context.bot, chat_id, texto, media_file_id, media_type, markup,
+            markup_fallback=markup_simple, fmt=fmt, plain=plano
         )
         try:
             await context.bot.pin_chat_message(chat_id=chat_id, message_id=nuevo_msg.message_id, disable_notification=True)
@@ -514,13 +658,13 @@ async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
         return
 
     if nuevo_msg:
-        save_programado_campo(chat_id, "ultimo_message_id", nuevo_msg.message_id)
-        save_programado_campo(chat_id, "ultimo_envio_ts", nuevo_msg.date.timestamp())
+        save_programado_campo(chat_id, pid, "ultimo_message_id", nuevo_msg.message_id)
+        save_programado_campo(chat_id, pid, "ultimo_envio_ts", nuevo_msg.date.timestamp())
 
-def programar_job_mensaje(app_or_context, chat_id, intervalo_key, first_delay=0):
-    """Registra (o reemplaza) el job repetitivo de mensaje programado para un chat."""
+def programar_job_mensaje(app_or_context, chat_id, pid, intervalo_key, first_delay=0):
+    """Registra (o reemplaza) el job repetitivo de UN mensaje programado."""
     job_queue = app_or_context.job_queue
-    for j in job_queue.get_jobs_by_name(f"programado_{chat_id}"):
+    for j in job_queue.get_jobs_by_name(nombre_job(chat_id, pid)):
         j.schedule_removal()
     segundos = INTERVALOS.get(intervalo_key)
     if not segundos:
@@ -530,33 +674,26 @@ def programar_job_mensaje(app_or_context, chat_id, intervalo_key, first_delay=0)
         interval=segundos,
         first=max(first_delay, 0),
         chat_id=chat_id,
-        name=f"programado_{chat_id}"
+        name=nombre_job(chat_id, pid),
+        data=pid,
     )
 
-def cancelar_job_mensaje(app_or_context, chat_id):
-    job_queue = app_or_context.job_queue
-    for j in job_queue.get_jobs_by_name(f"programado_{chat_id}"):
+def cancelar_job_mensaje(app_or_context, chat_id, pid):
+    for j in app_or_context.job_queue.get_jobs_by_name(nombre_job(chat_id, pid)):
         j.schedule_removal()
 
 async def restaurar_jobs_programados(app):
-    """Al iniciar el bot, vuelve a armar los jobs de todos los mensajes programados
-    activos, calculando cuánto falta según el último envío guardado en Mongo
-    (para no perder el conteo ni reenviar de más al reiniciar el bot)."""
-    import time
+    """Al iniciar el bot, vuelve a armar los jobs de TODOS los mensajes programados activos,
+    calculando cuánto falta según el último envío guardado (sin perder el conteo al reiniciar)."""
     ahora = time.time()
     for conf in col_programado.find({"activo": True}):
-        chat_id = conf["chat_id"]
-        intervalo_key = conf.get("intervalo")
-        segundos = INTERVALOS.get(intervalo_key)
-        if not segundos:
+        chat_id, pid = conf["chat_id"], conf.get("pid")
+        segundos = INTERVALOS.get(conf.get("intervalo"))
+        if not segundos or not pid:
             continue
         ultimo_ts = conf.get("ultimo_envio_ts")
-        if ultimo_ts:
-            transcurrido = ahora - ultimo_ts
-            espera = max(segundos - transcurrido, 0)
-        else:
-            espera = 0
-        programar_job_mensaje(app, chat_id, intervalo_key, first_delay=espera)
+        espera = max(segundos - (ahora - ultimo_ts), 0) if ultimo_ts else 0
+        programar_job_mensaje(app, chat_id, pid, conf["intervalo"], first_delay=espera)
 
 # --- MENSAJES DE TEXTO Y FLUJOS (PANEL PRIVADO) ---
 
@@ -599,7 +736,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "esperando_bienvenida_texto":
         estado_panel[user_id]["step"] = "idle"
-        save_bienvenida_campo(chat_id_sel, "texto", text)
+        d = datos_texto(update.message)
+        save_bienvenida_campo(chat_id_sel, "texto", d["texto"])
+        save_bienvenida_campo(chat_id_sel, "texto_html", d["texto_html"])
         await update.message.reply_text("✅ Texto de bienvenida guardado.", reply_markup=menu_bienvenida())
         return
 
@@ -624,39 +763,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if step == "esperando_bienvenida_botones":
         estado_panel[user_id]["step"] = "idle"
-        save_bienvenida_campo(chat_id_sel, "botones_raw", text)
+        save_bienvenida_campo(chat_id_sel, "botones_raw", tokenizar_emojis(update.message))
         await update.message.reply_text("✅ Botones guardados.", reply_markup=menu_bienvenida())
         return
 
+    pid = estado_panel[user_id].get("pid")
+
     if step == "esperando_prog_texto":
         estado_panel[user_id]["step"] = "idle"
-        save_programado_campo(chat_id_sel, "texto", text)
-        await update.message.reply_text("✅ Texto del mensaje programado guardado.", reply_markup=menu_programado(chat_id_sel))
+        d = datos_texto(update.message)
+        save_programado_campo(chat_id_sel, pid, "texto", d["texto"])
+        save_programado_campo(chat_id_sel, pid, "texto_html", d["texto_html"])
+        await update.message.reply_text("✅ Texto del mensaje programado guardado.", reply_markup=menu_programado(chat_id_sel, pid))
         return
 
     if step == "esperando_prog_media":
         if update.message.photo:
-            file_id = update.message.photo[-1].file_id
-            save_programado_campo(chat_id_sel, "media_file_id", file_id)
-            save_programado_campo(chat_id_sel, "media_type", "photo")
+            save_programado_campo(chat_id_sel, pid, "media_file_id", update.message.photo[-1].file_id)
+            save_programado_campo(chat_id_sel, pid, "media_type", "photo")
         elif update.message.video:
-            file_id = update.message.video.file_id
-            save_programado_campo(chat_id_sel, "media_file_id", file_id)
-            save_programado_campo(chat_id_sel, "media_type", "video")
+            save_programado_campo(chat_id_sel, pid, "media_file_id", update.message.video.file_id)
+            save_programado_campo(chat_id_sel, pid, "media_type", "video")
         else:
             await update.message.reply_text(
                 "⚠️ Envía una foto o un video.",
-                reply_markup=menu_editor_campo("prog_media_eliminar", "prog_inicio")
+                reply_markup=menu_editor_campo("prog_media_eliminar", "prog_item")
             )
             return
         estado_panel[user_id]["step"] = "idle"
-        await update.message.reply_text("✅ Multimedia guardada.", reply_markup=menu_programado(chat_id_sel))
+        await update.message.reply_text("✅ Multimedia guardada.", reply_markup=menu_programado(chat_id_sel, pid))
         return
 
     if step == "esperando_prog_botones":
         estado_panel[user_id]["step"] = "idle"
-        save_programado_campo(chat_id_sel, "botones_raw", text)
-        await update.message.reply_text("✅ Botones guardados.", reply_markup=menu_programado(chat_id_sel))
+        save_programado_campo(chat_id_sel, pid, "botones_raw", tokenizar_emojis(update.message))
+        await update.message.reply_text("✅ Botones guardados.", reply_markup=menu_programado(chat_id_sel, pid))
         return
 
 # --- CALLBACKS DE BOTONES ESPECIALES DE BIENVENIDA (popup / copy / rules) ---
@@ -753,7 +894,9 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         estado_panel[user_id]["step"] = "esperando_bienvenida_texto"
         await query.edit_message_text(
             "📝 Envía el nuevo texto de bienvenida.\n\n"
-            "Puedes usar `{MENTION}` para mencionar al usuario que se une.",
+            "Puedes usar `{MENTION}` para mencionar al usuario que se une.\n\n"
+            "💎 También puedes usar *emojis premium* y el formato de Telegram (negrita, cursiva, enlaces...). "
+            "Si los usas, no escribas asteriscos a mano: el formato se toma del propio mensaje.",
             parse_mode="Markdown",
             reply_markup=menu_editor_campo("bienv_texto_eliminar", "bienv_inicio")
         )
@@ -762,6 +905,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data == "bienv_texto_eliminar":
         estado_panel[user_id]["step"] = "idle"
         save_bienvenida_campo(chat_id_sel, "texto", None)
+        save_bienvenida_campo(chat_id_sel, "texto_html", None)
         await query.edit_message_text("🗑️ Texto de bienvenida eliminado.", reply_markup=menu_bienvenida())
         return
 
@@ -785,6 +929,10 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(
             "🔘 Envía los botones con el formato:\n\n"
             "`Título del botón - t.me/LinkEjemplo`\n\n"
+            "Colores: `#g` verde · `#r` rojo · `#p` azul, al inicio\n"
+            "`#g Título - t.me/LinkEjemplo`\n"
+            "Emoji premium como icono: ponlo justo antes del título\n"
+            "`#r 🔥 Título - t.me/LinkEjemplo` (con tu emoji premium)\n\n"
             "Varios en una línea: separa con ` && `\n"
             "Varias filas: una por línea\n\n"
             "Especiales:\n"
@@ -814,146 +962,187 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("⚠️ No hay bienvenida configurada aún.", show_alert=True)
             return
 
-        texto_preview = (texto or "").replace(
-            "{MENTION}", f"[{query.from_user.first_name}](tg://user?id={query.from_user.id})"
-        )
-        markup = parsear_botones(botones_raw) if botones_raw else None
+        texto_preview, fmt, plano = preparar_texto(conf, query.from_user)
+        markup, markup_simple = parsear_botones_ext(botones_raw)
 
         try:
-            await enviar_mensaje_seguro(context.bot, user_id, texto_preview, media_file_id, media_type, markup)
+            await enviar_mensaje_seguro(context.bot, user_id, texto_preview, media_file_id, media_type, markup,
+                                        markup_fallback=markup_simple, fmt=fmt, plain=plano)
         except Exception as e:
             await context.bot.send_message(chat_id=user_id, text=f"❌ No se pudo enviar la vista previa: {e}")
         return
 
-    # --- MENSAJE PROGRAMADO ---
+    # --- MENSAJES PROGRAMADOS (varios por grupo) ---
+
+    est = estado_panel[user_id]
 
     if data == "prog_inicio":
-        estado_panel[user_id]["step"] = "idle"
+        est["step"], est["pid"] = "idle", None
         await query.edit_message_text(
-            "📌 **Mensaje Programado**\n"
-            "Se reenvía repitiendo cada intervalo elegido, fijado en el chat, "
-            "borrando la copia anterior (igual que la bienvenida).",
-            parse_mode="Markdown",
-            reply_markup=menu_programado(chat_id_sel)
+            "📌 Mensajes Programados\n\n"
+            "Puedes crear varios. Cada uno se repite en su propio intervalo, se fija en el chat "
+            "y borra su copia anterior.\n🟢 encendido · 🔴 apagado",
+            reply_markup=menu_lista_programados(chat_id_sel)
         )
         return
 
-    if data == "prog_texto":
-        estado_panel[user_id]["step"] = "esperando_prog_texto"
+    if data == "prog_nuevo":
+        if len(listar_programados(chat_id_sel)) >= MAX_PROGRAMADOS:
+            await query.answer(f"⚠️ Máximo {MAX_PROGRAMADOS} mensajes programados por grupo.", show_alert=True)
+            return
+        pid, num = crear_programado(chat_id_sel)
+        est["step"], est["pid"] = "idle", pid
         await query.edit_message_text(
-            "📝 Envía el nuevo texto del mensaje programado:",
-            reply_markup=menu_editor_campo("prog_texto_eliminar", "prog_inicio")
+            f"📌 Mensaje programado #{num} creado.\nConfigura texto/multimedia, botones e intervalo, y enciéndelo.",
+            reply_markup=menu_programado(chat_id_sel, pid)
         )
         return
 
-    if data == "prog_texto_eliminar":
-        estado_panel[user_id]["step"] = "idle"
-        save_programado_campo(chat_id_sel, "texto", None)
-        await query.edit_message_text("🗑️ Texto del mensaje programado eliminado.", reply_markup=menu_programado(chat_id_sel))
+    if data.startswith("prog_sel_"):
+        pid = data[len("prog_sel_"):]
+        conf = get_programado(chat_id_sel, pid)
+        if not conf:
+            await query.edit_message_text("⚠️ Ese mensaje ya no existe.", reply_markup=menu_lista_programados(chat_id_sel))
+            return
+        est["step"], est["pid"] = "idle", pid
+        await query.edit_message_text(f"📌 Mensaje programado #{conf['num']}", reply_markup=menu_programado(chat_id_sel, pid))
         return
 
-    if data == "prog_media":
-        estado_panel[user_id]["step"] = "esperando_prog_media"
-        await query.edit_message_text(
-            "🖼️ Envía la foto o video del mensaje programado:",
-            reply_markup=menu_editor_campo("prog_media_eliminar", "prog_inicio")
-        )
-        return
+    if data.startswith("prog_"):
+        pid = est.get("pid")
+        conf = get_programado(chat_id_sel, pid) if pid else None
+        if not conf:
+            await query.edit_message_text("📌 Mensajes Programados", reply_markup=menu_lista_programados(chat_id_sel))
+            return
+        num = conf["num"]
 
-    if data == "prog_media_eliminar":
-        estado_panel[user_id]["step"] = "idle"
-        save_programado_campo(chat_id_sel, "media_file_id", None)
-        save_programado_campo(chat_id_sel, "media_type", None)
-        await query.edit_message_text("🗑️ Multimedia del mensaje programado eliminada.", reply_markup=menu_programado(chat_id_sel))
-        return
-
-    if data == "prog_botones":
-        estado_panel[user_id]["step"] = "esperando_prog_botones"
-        await query.edit_message_text(
-            "🔘 Envía los botones con el formato:\n\n"
-            "`Título del botón - t.me/LinkEjemplo`\n\n"
-            "Varios en una línea: separa con ` && `\n"
-            "Varias filas: una por línea\n\n"
-            "Especiales:\n"
-            "`Título - popup:Texto emergente`\n"
-            "`Título - share:Texto a compartir`\n"
-            "`Título - copy:Texto a copiar`",
-            parse_mode="Markdown",
-            reply_markup=menu_editor_campo("prog_botones_eliminar", "prog_inicio")
-        )
-        return
-
-    if data == "prog_botones_eliminar":
-        estado_panel[user_id]["step"] = "idle"
-        save_programado_campo(chat_id_sel, "botones_raw", None)
-        await query.edit_message_text("🗑️ Botones del mensaje programado eliminados.", reply_markup=menu_programado(chat_id_sel))
-        return
-
-    if data == "prog_preview":
-        conf = get_programado(chat_id_sel)
-        texto = conf.get("texto")
-        media_file_id = conf.get("media_file_id")
-        media_type = conf.get("media_type")
-        botones_raw = conf.get("botones_raw")
-
-        if not texto and not media_file_id:
-            await query.answer("⚠️ No hay mensaje programado configurado aún.", show_alert=True)
+        if data == "prog_item":
+            est["step"] = "idle"
+            await query.edit_message_text(f"📌 Mensaje programado #{num}", reply_markup=menu_programado(chat_id_sel, pid))
             return
 
-        markup = parsear_botones(botones_raw) if botones_raw else None
+        if data == "prog_texto":
+            est["step"] = "esperando_prog_texto"
+            await query.edit_message_text(
+                f"📝 Envía el nuevo texto del mensaje programado #{num}.\n\n"
+                "💎 Puedes usar emojis premium y el formato de Telegram (negrita, cursiva, enlaces...).",
+                reply_markup=menu_editor_campo("prog_texto_eliminar", "prog_item")
+            )
+            return
 
-        try:
-            await enviar_mensaje_seguro(context.bot, user_id, texto, media_file_id, media_type, markup)
-        except Exception as e:
-            await context.bot.send_message(chat_id=user_id, text=f"❌ No se pudo enviar la vista previa: {e}")
-        return
+        if data == "prog_texto_eliminar":
+            est["step"] = "idle"
+            save_programado_campo(chat_id_sel, pid, "texto", None)
+            save_programado_campo(chat_id_sel, pid, "texto_html", None)
+            await query.edit_message_text("🗑️ Texto eliminado.", reply_markup=menu_programado(chat_id_sel, pid))
+            return
 
-    if data == "prog_intervalo":
-        await query.edit_message_text(
-            "⏱️ ¿Cada cuánto se reenvía el mensaje?",
-            reply_markup=menu_intervalo(chat_id_sel)
-        )
-        return
+        if data == "prog_media":
+            est["step"] = "esperando_prog_media"
+            await query.edit_message_text(
+                f"🖼️ Envía la foto o video del mensaje programado #{num}:",
+                reply_markup=menu_editor_campo("prog_media_eliminar", "prog_item")
+            )
+            return
 
-    if data.startswith("prog_setint_"):
-        intervalo_key = data.split("prog_setint_", 1)[1]
-        save_programado_campo(chat_id_sel, "intervalo", intervalo_key)
-        conf = get_programado(chat_id_sel)
-        if conf.get("activo"):
-            # Si ya estaba encendido, reprogramar con el intervalo nuevo desde ahora
-            programar_job_mensaje(context, chat_id_sel, intervalo_key, first_delay=0)
-        await query.edit_message_text(
-            f"✅ Intervalo actualizado a {INTERVALOS_LABEL[intervalo_key]}.",
-            reply_markup=menu_programado(chat_id_sel)
-        )
-        return
+        if data == "prog_media_eliminar":
+            est["step"] = "idle"
+            save_programado_campo(chat_id_sel, pid, "media_file_id", None)
+            save_programado_campo(chat_id_sel, pid, "media_type", None)
+            await query.edit_message_text("🗑️ Multimedia eliminada.", reply_markup=menu_programado(chat_id_sel, pid))
+            return
 
-    if data == "prog_toggle":
-        conf = get_programado(chat_id_sel)
-        nuevo_estado = not conf.get("activo", False)
+        if data == "prog_botones":
+            est["step"] = "esperando_prog_botones"
+            await query.edit_message_text(
+                "🔘 Envía los botones con el formato:\n\n"
+                "`Título del botón - t.me/LinkEjemplo`\n\n"
+                "Colores: `#g` verde · `#r` rojo · `#p` azul, al inicio\n"
+                "`#g Título - t.me/LinkEjemplo`\n"
+                "Emoji premium como icono: ponlo justo antes del título\n"
+                "`#r 🔥 Título - t.me/LinkEjemplo` (con tu emoji premium)\n\n"
+                "Varios en una línea: separa con ` && `\n"
+                "Varias filas: una por línea\n\n"
+                "Especiales:\n"
+                "`Título - popup:Texto emergente`\n"
+                "`Título - share:Texto a compartir`\n"
+                "`Título - copy:Texto a copiar`",
+                parse_mode="Markdown",
+                reply_markup=menu_editor_campo("prog_botones_eliminar", "prog_item")
+            )
+            return
 
-        if nuevo_estado:
-            if not conf.get("intervalo"):
-                await query.answer("⚠️ Elige primero un intervalo.", show_alert=True)
-                return
+        if data == "prog_botones_eliminar":
+            est["step"] = "idle"
+            save_programado_campo(chat_id_sel, pid, "botones_raw", None)
+            await query.edit_message_text("🗑️ Botones eliminados.", reply_markup=menu_programado(chat_id_sel, pid))
+            return
+
+        if data == "prog_preview":
             if not conf.get("texto") and not conf.get("media_file_id"):
-                await query.answer("⚠️ Configura texto o multimedia primero.", show_alert=True)
+                await query.answer("⚠️ Este mensaje programado aún no tiene contenido.", show_alert=True)
                 return
-            save_programado_campo(chat_id_sel, "activo", True)
-            programar_job_mensaje(context, chat_id_sel, conf["intervalo"], first_delay=0)
-        else:
-            save_programado_campo(chat_id_sel, "activo", False)
-            cancelar_job_mensaje(context, chat_id_sel)
+            markup, markup_simple = parsear_botones_ext(conf.get("botones_raw"))
+            texto_preview, fmt, plano = preparar_texto(conf)
+            try:
+                await enviar_mensaje_seguro(context.bot, user_id, texto_preview, conf.get("media_file_id"),
+                                            conf.get("media_type"), markup, markup_fallback=markup_simple,
+                                            fmt=fmt, plain=plano)
+            except Exception as e:
+                await context.bot.send_message(chat_id=user_id, text=f"❌ No se pudo enviar la vista previa: {e}")
+            return
 
-        await query.edit_message_text(
-            "📌 **Mensaje Programado**",
-            parse_mode="Markdown",
-            reply_markup=menu_programado(chat_id_sel)
-        )
-        return
+        if data == "prog_intervalo":
+            await query.edit_message_text("⏱️ ¿Cada cuánto se reenvía el mensaje?", reply_markup=menu_intervalo(chat_id_sel, pid))
+            return
+
+        if data.startswith("prog_setint_"):
+            intervalo_key = data.split("prog_setint_", 1)[1]
+            save_programado_campo(chat_id_sel, pid, "intervalo", intervalo_key)
+            if conf.get("activo"):
+                programar_job_mensaje(context, chat_id_sel, pid, intervalo_key, first_delay=0)
+            await query.edit_message_text(
+                f"✅ Intervalo actualizado a {INTERVALOS_LABEL[intervalo_key]}.",
+                reply_markup=menu_programado(chat_id_sel, pid)
+            )
+            return
+
+        if data == "prog_toggle":
+            if not conf.get("activo"):
+                if not conf.get("intervalo"):
+                    await query.answer("⚠️ Elige primero un intervalo.", show_alert=True)
+                    return
+                if not conf.get("texto") and not conf.get("media_file_id"):
+                    await query.answer("⚠️ Configura texto o multimedia primero.", show_alert=True)
+                    return
+                save_programado_campo(chat_id_sel, pid, "activo", True)
+                programar_job_mensaje(context, chat_id_sel, pid, conf["intervalo"], first_delay=0)
+            else:
+                save_programado_campo(chat_id_sel, pid, "activo", False)
+                cancelar_job_mensaje(context, chat_id_sel, pid)
+            await query.edit_message_text(f"📌 Mensaje programado #{num}", reply_markup=menu_programado(chat_id_sel, pid))
+            return
+
+        if data == "prog_eliminar":
+            await query.edit_message_text(
+                f"🗑️ ¿Eliminar el mensaje programado #{num}? Se apaga y se borra su configuración.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Sí, eliminar", callback_data="prog_eliminar_si"),
+                    InlineKeyboardButton("↩️ No", callback_data="prog_item"),
+                ]])
+            )
+            return
+
+        if data == "prog_eliminar_si":
+            cancelar_job_mensaje(context, chat_id_sel, pid)
+            eliminar_programado(chat_id_sel, pid)
+            est["step"], est["pid"] = "idle", None
+            await query.edit_message_text(f"🗑️ Mensaje programado #{num} eliminado.", reply_markup=menu_lista_programados(chat_id_sel))
+            return
 
 def main():
     threading.Thread(target=run_web_server, daemon=True).start()
+    migrar_programados()
     app = Application.builder().token(TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
