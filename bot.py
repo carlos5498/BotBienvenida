@@ -6,6 +6,7 @@ import hashlib
 import re
 import time
 import uuid
+import datetime
 from html import escape as html_escape
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,6 +37,7 @@ col_bienvenida = db['bienvenida_config']
 col_ultimo_msg = db['ultimo_mensaje_bienvenida']
 col_botones_data = db['botones_callback_data']
 col_programado = db['mensaje_programado']
+col_moderadores = db['moderadores_grupo']
 
 usuarios_autorizados = set()
 grupos_por_usuario = {}
@@ -108,7 +110,6 @@ async def cargar_grupos_usuario_validados(user_id, bot):
                 desregistrar_grupo(chat_id)
                 grupos.pop(chat_id, None)
         except Exception:
-            # El bot ya no tiene acceso a ese chat (lo sacaron, lo borraron, etc.)
             desregistrar_grupo(chat_id)
             grupos.pop(chat_id, None)
     return grupos
@@ -120,6 +121,40 @@ def cargar_grupos_usuario(user_id):
     grupos = {d["chat_id"]: d["title"] for d in docs}
     grupos_por_usuario[user_id] = grupos
     return grupos
+
+# --- HELPERS MODERADORES POR GRUPO ---
+
+def agregar_moderador(chat_id, mod_id, agregado_por):
+    col_moderadores.update_one(
+        {"chat_id": chat_id, "user_id": mod_id},
+        {"$set": {
+            "chat_id": chat_id,
+            "user_id": mod_id,
+            "agregado_por": agregado_por,
+            "fecha": datetime.datetime.utcnow()
+        }},
+        upsert=True
+    )
+
+def quitar_moderador(chat_id, mod_id):
+    col_moderadores.delete_one({"chat_id": chat_id, "user_id": mod_id})
+
+def obtener_moderadores(chat_id):
+    return list(col_moderadores.find({"chat_id": chat_id}).sort("fecha", -1))
+
+def es_moderador_grupo(chat_id, user_id):
+    return col_moderadores.find_one({"chat_id": chat_id, "user_id": user_id}) is not None
+
+async def puede_moderar_grupo(context, chat_id, user_id):
+    """Retorna True si el usuario es admin del grupo o moderador registrado en ese grupo."""
+    if es_moderador_grupo(chat_id, user_id):
+        return True
+    try:
+        admins = await context.bot.get_chat_administrators(chat_id)
+        admins_ids = {a.user.id for a in admins}
+        return user_id in admins_ids
+    except Exception:
+        return False
 
 def get_bienvenida(chat_id):
     doc = col_bienvenida.find_one({"chat_id": chat_id})
@@ -159,7 +194,6 @@ def get_programado(chat_id, pid):
     return doc
 
 def save_programado_campo(chat_id, pid, campo, valor):
-    # sin upsert: si el mensaje fue eliminado, un envío pendiente no lo vuelve a crear
     col_programado.update_one({"chat_id": chat_id, "pid": pid}, {"$set": {campo: valor}})
 
 def crear_programado(chat_id):
@@ -226,7 +260,6 @@ def _boton(titulo, style=None, icon=None, **kw):
         extra["style"] = style
     if icon:
         extra["icon_custom_emoji_id"] = icon
-    # api_kwargs envía los campos nuevos de la Bot API 9.4 aunque la librería aún no los traiga
     return InlineKeyboardButton(titulo, api_kwargs=extra or None, **kw)
 
 def construir_boton(titulo, resto, style=None, icon=None):
@@ -245,15 +278,12 @@ def construir_boton(titulo, resto, style=None, icon=None):
         return _boton(titulo, style, icon, callback_data=f"wcopy_{short_id}")
     if resto_lower.strip() == "rules":
         return _boton(titulo, style, icon, callback_data="wrules_none")
-    # Por defecto: botón de enlace (URL)
     url = resto.strip()
     if not url.startswith("http://") and not url.startswith("https://"):
         url = "https://" + url
     return _boton(titulo, style, icon, url=url)
 
 def parsear_botones_ext(texto_botones):
-    """Devuelve (teclado, teclado_simple). El simple no lleva colores ni iconos: se usa de respaldo si
-    Telegram rechazara el icono premium (p. ej. si el dueño del bot no tiene Premium)."""
     if not texto_botones:
         return None, None
     completo, simple = [], []
@@ -289,15 +319,11 @@ FORMATO_TYPES = {"custom_emoji", "bold", "italic", "underline", "strikethrough",
                  "text_link", "blockquote", "expandable_blockquote", "text_mention"}
 
 def datos_texto(msg):
-    """Qué se guarda al editar un texto: el texto plano y, si el admin usó emojis premium o el formato
-    nativo de Telegram (negrita, enlaces...), también su versión HTML. Si no usó nada de eso, el texto
-    sigue funcionando con el Markdown clásico de siempre (*negrita*, [texto](link))."""
     plano = msg.text or ""
     rico = any(e.type in FORMATO_TYPES for e in (msg.entities or ()))
     return {"texto": plano, "texto_html": msg.text_html if rico else None}
 
 def preparar_texto(conf, user=None):
-    """(texto_a_enviar, formato, texto_plano_de_respaldo)."""
     plano = conf.get("texto") or ""
     h = conf.get("texto_html")
     if h:
@@ -316,10 +342,6 @@ def construir_texto_bienvenida(texto, user):
     return texto.replace("{MENTION}", mention)
 
 async def enviar_mensaje_seguro(bot, chat_id, texto, media_file_id, media_type, markup, **extra):
-    """Envía texto/foto/video y se asegura de que el mensaje SIEMPRE salga. Intentos, en orden:
-    1) con el formato y los botones tal cual (HTML con emojis premium, o Markdown clásico);
-    2) con botones simples (sin color ni icono premium), si Telegram rechazó los botones;
-    3) en texto plano, si el formato era inválido o Telegram rechazó los emojis premium."""
     fallback = extra.pop("markup_fallback", None)
     fmt = extra.pop("fmt", None)
     plano = extra.pop("plain", None)
@@ -377,14 +399,43 @@ def menu_grupos(user_id):
         keyboard.append([InlineKeyboardButton("⚠️ Sin grupos disponibles", callback_data="none")])
     return InlineKeyboardMarkup(keyboard)
 
-def menu_grupo_panel():
+def menu_grupo_panel(chat_id=None):
+    cant_mods = col_moderadores.count_documents({"chat_id": chat_id}) if chat_id else 0
     keyboard = [
         [InlineKeyboardButton("📨 Enviar Mensaje", callback_data="msg_enviar")],
         [InlineKeyboardButton("👋 Mensaje de Bienvenida", callback_data="bienv_inicio")],
         [InlineKeyboardButton("📌 Mensajes Programados", callback_data="prog_inicio")],
+        [InlineKeyboardButton(f"🛡️ Moderadores ({cant_mods})", callback_data="mods_inicio")],
         [InlineKeyboardButton("🔄 Cambiar grupo", callback_data="sel_grupo")],
     ]
     return InlineKeyboardMarkup(keyboard)
+
+async def render_menu_moderadores(query_or_msg, chat_id, es_mensaje=False):
+    mods = obtener_moderadores(chat_id)
+    texto = (
+        "🛡️ **Moderadores de este grupo**\n\n"
+        "Los moderadores pueden usar `/send mensaje` (o responder a un mensaje con `/send`) "
+        "dentro de este grupo para que el bot lo reenvíe y lo fije para todos.\n\n"
+    )
+    keyboard = [
+        [InlineKeyboardButton("➕ Añadir moderador por ID", callback_data="mods_add")]
+    ]
+    if mods:
+        texto += "**Moderadores actuales:**\n"
+        for m in mods:
+            uid = m["user_id"]
+            texto += f"• `{uid}`\n"
+            keyboard.append([InlineKeyboardButton(f"❌ Quitar {uid}", callback_data=f"mods_del_{uid}")])
+    else:
+        texto += "_No hay moderadores añadidos en este grupo._"
+
+    keyboard.append([InlineKeyboardButton("⬅️ Atrás", callback_data="back_main")])
+    markup = InlineKeyboardMarkup(keyboard)
+
+    if es_mensaje:
+        await query_or_msg.reply_text(texto, parse_mode="Markdown", reply_markup=markup)
+    else:
+        await query_or_msg.edit_message_text(texto, parse_mode="Markdown", reply_markup=markup)
 
 def menu_bienvenida():
     keyboard = [
@@ -397,8 +448,6 @@ def menu_bienvenida():
     return InlineKeyboardMarkup(keyboard)
 
 def menu_editor_campo(cb_eliminar, cb_atras):
-    """Teclado que acompaña el prompt de edición de un campo (texto/media/botones):
-    Eliminar ese campo específico, o Cancelar y volver atrás."""
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🗑️ Eliminar", callback_data=cb_eliminar)],
         [InlineKeyboardButton("⬅️ Cancelar y Atrás", callback_data=cb_atras)],
@@ -456,6 +505,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if update.effective_chat.type != "private":
         return
+    if user_id in estado_panel:
+        estado_panel[user_id]["step"] = "idle"
     if not is_autorizado(user_id):
         return await update.message.reply_text("🔐 Envía la contraseña para acceder.")
     await buscar_grupos(update, context)
@@ -505,12 +556,6 @@ async def cmd_reload(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 async def cmd_principal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Enviado dentro de un tema de un grupo de temas (forum), guarda ese tema
-    como destino de los mensajes de bienvenida para ese grupo.
-    Enviado en el tema General (sin thread_id), vuelve a mandar las
-    bienvenidas al chat/tema General.
-    """
     chat = update.effective_chat
     user_id = update.effective_user.id
 
@@ -533,7 +578,7 @@ async def cmd_principal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    thread_id = update.message.message_thread_id  # None si es el tema General
+    thread_id = update.message.message_thread_id
     save_bienvenida_campo(chat.id, "topic_principal", thread_id)
 
     if thread_id:
@@ -546,6 +591,106 @@ async def cmd_principal(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ A partir de ahora las bienvenidas se enviarán en el tema General."
         )
 
+async def cmd_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Comando usable por administradores y moderadores del grupo:
+    - `/send texto del mensaje`: reenvía ese texto al grupo y lo fija para todos.
+    - Respondiendo a un mensaje con `/send`: copia ese mensaje al grupo y lo fija para todos.
+    """
+    chat = update.effective_chat
+    user = update.effective_user
+    msg = update.effective_message
+
+    if chat.type not in ("group", "supergroup"):
+        return
+
+    if not await puede_moderar_grupo(context, chat.id, user.id):
+        return
+
+    thread_id = msg.message_thread_id
+    envio_kwargs = {"message_thread_id": thread_id} if thread_id else {}
+
+    nuevo_msg = None
+
+    # Caso 1: Se usó /send respondiendo a otro mensaje (sirve para texto, fotos, videos, etc.)
+    if msg.reply_to_message:
+        try:
+            nuevo_msg = await context.bot.copy_message(
+                chat_id=chat.id,
+                from_chat_id=chat.id,
+                message_id=msg.reply_to_message.message_id,
+                **envio_kwargs
+            )
+        except Exception as e:
+            logging.warning(f"Error copiando mensaje con /send en {chat.id}: {e}")
+            return
+    else:
+        # Caso 2: /send <mensaje> escrito directamente
+        raw_text = msg.text or ""
+        # Extraer todo lo que sigue después de /send o /send@NombreBot
+        match = re.match(r"^/send(?:@\w+)?(?:\s+(.*))?$", raw_text, flags=re.DOTALL | re.IGNORECASE)
+        contenido = (match.group(1) if match else "").strip()
+
+        if not contenido:
+            aviso = await msg.reply_text("⚠️ Uso: `/send tu mensaje` (o responde a un mensaje con `/send`).", parse_mode="Markdown")
+            await asyncio.sleep(5)
+            try:
+                await aviso.delete()
+                await msg.delete()
+            except:
+                pass
+            return
+
+        # Conservar formato HTML si el usuario usó negritas/enlaces/emojis premium, ajustando el offset de "/send "
+        prefix_len = len(raw_text) - len(contenido)
+        rico = any(e.type in FORMATO_TYPES for e in (msg.entities or ()))
+
+        try:
+            if rico:
+                # Reconstruir texto HTML quitando el prefijo "/send "
+                html_completo = msg.text_html or contenido
+                html_limpio = re.sub(r"^/send(?:@\w+)?\s+", "", html_completo, count=1, flags=re.DOTALL | re.IGNORECASE)
+                nuevo_msg = await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=html_limpio,
+                    parse_mode="HTML",
+                    **envio_kwargs
+                )
+            else:
+                nuevo_msg = await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=contenido,
+                    **envio_kwargs
+                )
+        except Exception as e:
+            logging.warning(f"Error enviando mensaje con /send en {chat.id}: {e}")
+            try:
+                nuevo_msg = await context.bot.send_message(
+                    chat_id=chat.id,
+                    text=contenido,
+                    **envio_kwargs
+                )
+            except Exception as e2:
+                logging.error(f"Fallo total en /send en {chat.id}: {e2}")
+                return
+
+    # Fijar el mensaje enviado para todos (con notificación activada: disable_notification=False)
+    if nuevo_msg:
+        try:
+            await context.bot.pin_chat_message(
+                chat_id=chat.id,
+                message_id=nuevo_msg.message_id,
+                disable_notification=False
+            )
+        except Exception as e:
+            logging.warning(f"No se pudo fijar el mensaje de /send en {chat.id}: {e}")
+
+    # Borrar el comando "/send ..." del moderador/admin para dejar limpio el chat
+    try:
+        await msg.delete()
+    except:
+        pass
+
 # --- DETECCIÓN DE NUEVOS MIEMBROS (join directo o solicitud aceptada) ---
 
 async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -557,7 +702,7 @@ async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAUL
     fue_miembro = old_status in ("member", "administrator", "creator")
     es_miembro_ahora = new_status in ("member", "administrator", "creator")
     if fue_miembro or not es_miembro_ahora:
-        return  # No es un ingreso nuevo
+        return
 
     chat_id = result.chat.id
     user = result.new_chat_member.user
@@ -572,15 +717,14 @@ async def enviar_bienvenida(context, chat_id, user):
     media_file_id = conf.get("media_file_id")
     media_type = conf.get("media_type")
     botones_raw = conf.get("botones_raw")
-    topic_principal = conf.get("topic_principal")  # None = grupo normal o tema General
+    topic_principal = conf.get("topic_principal")
 
     if not texto and not media_file_id:
-        return  # Sin bienvenida configurada
+        return
 
     texto_final, fmt, plano = preparar_texto(conf, user) if texto else (None, None, None)
     markup, markup_simple = parsear_botones_ext(botones_raw)
 
-    # Borrar mensaje de bienvenida anterior
     anterior = col_ultimo_msg.find_one({"chat_id": chat_id})
     if anterior:
         try:
@@ -588,8 +732,6 @@ async def enviar_bienvenida(context, chat_id, user):
         except:
             pass
 
-    # Solo se pasa message_thread_id si hay un tema configurado con /principal.
-    # En grupos normales (sin temas) esto queda como None y se envía como siempre.
     envio_kwargs = {}
     if topic_principal:
         envio_kwargs["message_thread_id"] = topic_principal
@@ -622,7 +764,7 @@ async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
     conf = get_programado(chat_id, pid)
 
     if not conf or not conf.get("activo"):
-        return  # Se eliminó o se apagó; el job se remueve aparte, esto es una salvaguarda extra
+        return
 
     texto = conf.get("texto")
     media_file_id = conf.get("media_file_id")
@@ -630,12 +772,11 @@ async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
     botones_raw = conf.get("botones_raw")
 
     if not texto and not media_file_id:
-        return  # No hay contenido configurado, no hay nada que enviar
+        return
 
     markup, markup_simple = parsear_botones_ext(botones_raw)
     texto, fmt, plano = preparar_texto(conf)
 
-    # Borrar la copia anterior de ESTE mensaje programado
     anterior = conf.get("ultimo_message_id")
     if anterior:
         try:
@@ -662,7 +803,6 @@ async def enviar_programado(context: ContextTypes.DEFAULT_TYPE):
         save_programado_campo(chat_id, pid, "ultimo_envio_ts", nuevo_msg.date.timestamp())
 
 def programar_job_mensaje(app_or_context, chat_id, pid, intervalo_key, first_delay=0):
-    """Registra (o reemplaza) el job repetitivo de UN mensaje programado."""
     job_queue = app_or_context.job_queue
     for j in job_queue.get_jobs_by_name(nombre_job(chat_id, pid)):
         j.schedule_removal()
@@ -683,8 +823,6 @@ def cancelar_job_mensaje(app_or_context, chat_id, pid):
         j.schedule_removal()
 
 async def restaurar_jobs_programados(app):
-    """Al iniciar el bot, vuelve a armar los jobs de TODOS los mensajes programados activos,
-    calculando cuánto falta según el último envío guardado (sin perder el conteo al reiniciar)."""
     ahora = time.time()
     for conf in col_programado.find({"activo": True}):
         chat_id, pid = conf["chat_id"], conf.get("pid")
@@ -698,13 +836,14 @@ async def restaurar_jobs_programados(app):
 # --- MENSAJES DE TEXTO Y FLUJOS (PANEL PRIVADO) ---
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message: return
+    if not update.message:
+        return
     user_id = update.effective_user.id if update.effective_user else None
     text = update.message.text or ""
     chat = update.effective_chat
 
     if chat.type != "private":
-        return  # Este bot no procesa mensajes de grupo (solo eventos de ingreso)
+        return
 
     if not is_autorizado(user_id):
         if text.strip() == PASSWORD:
@@ -721,6 +860,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not step or step == "idle" or not chat_id_sel:
         return
 
+    if step == "esperando_mod_id":
+        id_txt = text.strip()
+        if not id_txt.isdigit():
+            await update.message.reply_text(
+                "⚠️ El ID del moderador debe ser un número (ejemplo: `123456789`).\n"
+                "Envía el ID numérico o pulsa Cancelar.",
+                parse_mode="Markdown",
+                reply_markup=boton_atras("mods_inicio")
+            )
+            return
+        nuevo_mod_id = int(id_txt)
+        agregar_moderador(chat_id_sel, nuevo_mod_id, user_id)
+        estado_panel[user_id]["step"] = "idle"
+        await update.message.reply_text(
+            f"✅ Moderador `{nuevo_mod_id}` añadido correctamente a este grupo.",
+            parse_mode="Markdown"
+        )
+        await render_menu_moderadores(update.message, chat_id_sel, es_mensaje=True)
+        return
+
     if step == "esperando_mensaje_grupo":
         estado_panel[user_id]["step"] = "idle"
         try:
@@ -729,9 +888,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 from_chat_id=update.message.chat_id,
                 message_id=update.message.message_id
             )
-            await update.message.reply_text("✅ Mensaje enviado al grupo.", reply_markup=menu_grupo_panel())
+            await update.message.reply_text("✅ Mensaje enviado al grupo.", reply_markup=menu_grupo_panel(chat_id_sel))
         except Exception as e:
-            await update.message.reply_text(f"❌ No se pudo enviar: {e}", reply_markup=menu_grupo_panel())
+            await update.message.reply_text(f"❌ No se pudo enviar: {e}", reply_markup=menu_grupo_panel(chat_id_sel))
         return
 
     if step == "esperando_bienvenida_texto":
@@ -826,7 +985,6 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = query.from_user.id
     data = query.data
 
-    # Callbacks de botones de bienvenida (se disparan en el grupo, sin requerir autorización)
     if data.startswith("wpopup_") or data.startswith("wcopy_") or data == "wrules_none":
         await welcome_button_callback(update, context)
         return
@@ -846,6 +1004,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id_sel = get_chat_sel(user_id)
 
     if data == "sel_grupo":
+        estado_panel[user_id]["step"] = "idle"
         await query.edit_message_text("👥 Selecciona el grupo a configurar:", reply_markup=menu_grupos(user_id))
         return
 
@@ -856,7 +1015,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         titulo = cargar_grupos_usuario(user_id).get(chat_id, str(chat_id))
         await query.edit_message_text(
             f"✅ Grupo: {titulo}\n\n📨 Panel de Mensajes:",
-            reply_markup=menu_grupo_panel()
+            reply_markup=menu_grupo_panel(chat_id)
         )
         return
 
@@ -871,7 +1030,31 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "back_main":
         estado_panel[user_id]["step"] = "idle"
-        await query.edit_message_text("📨 Panel de Mensajes:", reply_markup=menu_grupo_panel())
+        await query.edit_message_text("📨 Panel de Mensajes:", reply_markup=menu_grupo_panel(chat_id_sel))
+        return
+
+    # --- MODERADORES POR GRUPO ---
+    if data == "mods_inicio":
+        estado_panel[user_id]["step"] = "idle"
+        await render_menu_moderadores(query, chat_id_sel)
+        return
+
+    if data == "mods_add":
+        estado_panel[user_id]["step"] = "esperando_mod_id"
+        await query.edit_message_text(
+            "🛡️ **Añadir moderador**\n\n"
+            "Envía ahora el **ID numérico** del usuario que quieres hacer moderador en este grupo "
+            "(ejemplo: `123456789`).",
+            parse_mode="Markdown",
+            reply_markup=boton_atras("mods_inicio")
+        )
+        return
+
+    if data.startswith("mods_del_"):
+        mod_id = int(data.split("_")[-1])
+        quitar_moderador(chat_id_sel, mod_id)
+        await query.answer("✅ Moderador eliminado.", show_alert=True)
+        await render_menu_moderadores(query, chat_id_sel)
         return
 
     if data == "msg_enviar":
@@ -1148,9 +1331,10 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("reload", cmd_reload))
     app.add_handler(CommandHandler("principal", cmd_principal))
+    app.add_handler(CommandHandler("send", cmd_send))
     app.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
     app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(MessageHandler(filters.ALL, handle_message))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_message))
 
     app.job_queue.run_once(lambda ctx: asyncio.create_task(restaurar_jobs_programados(app)), when=1)
 
